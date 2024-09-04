@@ -1,30 +1,35 @@
 import datetime
 import time
 import os
+from transformers import GPT2Tokenizer
 from dotenv import load_dotenv
 from anthropic import Anthropic, RateLimitError
-import json
-
 # Load environment variables from .env file
 load_dotenv()
 
 # Configure Anthropic client
 client = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
 
+tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
+
+def count_tokens(text):
+    return len(tokenizer.encode(text))
+
 def split_into_sections(text, max_retries=5, initial_delay=1):
-    def chunk_text(text, chunk_size=15000):
+    def chunk_text(text, target_token_count=25000):  # Reduced to allow for output tokens
         words = text.split()
         chunks = []
         current_chunk = []
-        current_size = 0
+        current_token_count = 0
         for word in words:
-            if current_size + len(word) + 1 > chunk_size:
+            word_tokens = count_tokens(word)
+            if current_token_count + word_tokens > target_token_count:
                 chunks.append(' '.join(current_chunk))
                 current_chunk = [word]
-                current_size = len(word)
+                current_token_count = word_tokens
             else:
                 current_chunk.append(word)
-                current_size += len(word) + 1
+                current_token_count += word_tokens
         if current_chunk:
             chunks.append(' '.join(current_chunk))
         return chunks
@@ -48,6 +53,9 @@ def split_into_sections(text, max_retries=5, initial_delay=1):
     chunks = chunk_text(text)
     all_sections = []
     document_title = ""
+    total_tokens_used = 0
+    requests_made = 0
+    start_time = time.time()
 
     print(f"Text split into {len(chunks)} chunks for processing")
 
@@ -69,22 +77,27 @@ def split_into_sections(text, max_retries=5, initial_delay=1):
         {chunk}
         """
         
+        prompt_tokens = count_tokens(prompt)
+        
         for attempt in range(max_retries):
             try:
                 print(f"  Attempt {attempt + 1} of {max_retries}")
                 response = client.messages.create(
                     model="claude-3-5-sonnet-20240620",
-                    max_tokens=8192,
+                    max_tokens=8192,  # Set to the maximum allowed output tokens
                     messages=[
                         {"role": "user", "content": prompt}
                     ]
                 )
 
-                print(f"Raw response from Claude for chunk {i+1}:")
-                print(response.content)
-                
-                # Extrahera texten från TextBlock-objektet
                 response_text = response.content[0].text if response.content else ""
+                response_tokens = count_tokens(response_text)
+                total_tokens_used += prompt_tokens + response_tokens
+                requests_made += 1
+
+                print(f"Tokens used in this request: {prompt_tokens + response_tokens}")
+                print(f"Total tokens used so far: {total_tokens_used}")
+                print(f"Total requests made: {requests_made}")
                 
                 chunk_title, chunk_sections = parse_response(response_text)
                 if not document_title:
@@ -100,23 +113,25 @@ def split_into_sections(text, max_retries=5, initial_delay=1):
                 print(f"Total sections so far: {len(all_sections)}")
                 break
                 
-            except RateLimitError:
-                if attempt < max_retries - 1:
-                    delay = initial_delay * (2 ** attempt)
-                    print(f"  Rate limit exceeded. Retrying in {delay} seconds...")
-                    time.sleep(delay)
-                else:
-                    print("  Max retries reached. Unable to process request.")
-                    raise
             except Exception as e:
                 print(f"  An error occurred: {str(e)}")
                 if attempt == max_retries - 1:
                     raise
 
-        # Respect rate limit
-        if i < len(chunks) - 1:  # Don't wait after the last chunk
-            print(f"Waiting 12 seconds before processing next chunk...")
-            time.sleep(12)  # Wait 12 seconds between chunks to respect 5 requests/minute limit
+        # Respect rate limits
+        elapsed_time = time.time() - start_time
+        if elapsed_time < 60 and requests_made >= 50:
+            wait_time = 60 - elapsed_time
+            print(f"Rate limit approached. Waiting {wait_time:.2f} seconds...")
+            time.sleep(wait_time)
+            start_time = time.time()
+            requests_made = 0
+        elif total_tokens_used >= 40000:
+            wait_time = 60 - elapsed_time
+            print(f"Token limit approached. Waiting {wait_time:.2f} seconds...")
+            time.sleep(wait_time)
+            start_time = time.time()
+            total_tokens_used = 0
 
     print(f"\nAll chunks processed. Total sections: {len(all_sections)}")
     return {
@@ -144,18 +159,23 @@ def expand_section(section, document_title, max_retries=5, initial_delay=1):
     Den expanderade, detaljerade texten här...
     """
 
+    prompt_tokens = count_tokens(prompt)
+
     for attempt in range(max_retries):
         try:
             print(f"  Attempt {attempt + 1} of {max_retries}")
             response = client.messages.create(
                 model="claude-3-5-sonnet-20240620",
-                max_tokens=8192,
+                max_tokens=8192 - prompt_tokens,
                 messages=[
                     {"role": "user", "content": prompt}
                 ]
             )
 
             response_text = response.content[0].text if response.content else ""
+            response_tokens = count_tokens(response_text)
+            print(f"Tokens used in this request: {prompt_tokens + response_tokens}")
+
             if response_text.startswith("EXPANDED_CONTENT:"):
                 print(f"Section '{section['title']}' expanded successfully")
                 return response_text[18:].strip()
@@ -166,68 +186,123 @@ def expand_section(section, document_title, max_retries=5, initial_delay=1):
             print(f"Rate limit exceeded on attempt {attempt + 1}")
             if attempt < max_retries - 1:
                 delay = initial_delay * (2 ** attempt)
-                print(f"Rate limit exceeded. Retrying in {delay} seconds...")
+                print(f"Retrying in {delay} seconds...")
                 time.sleep(delay)
             else:
                 print("Max retries reached. Unable to process request.")
                 raise
         except Exception as e:
             print(f"An error occurred: {str(e)}")
-            raise
-        
-    print (f"Failed to expand section '{section['title']}' after {max_retries} attempts")
+            if attempt == max_retries - 1:
+                raise
+
+    print(f"Failed to expand section '{section['title']}' after {max_retries} attempts")
     raise Exception(f"Failed to expand section '{section['title']}' after {max_retries} attempts")
 
-def combine_sections(expanded_sections, document_title, max_retries=5, initial_delay=1):
-    print(f"Combining {len(expanded_sections)} expanded sections into final document...")
-    sections_text = "\n\n".join([f"Sektion {i+1}: {section['title']}\n\n{section['expanded_content']}" 
-                                 for i, section in enumerate(expanded_sections)])
+def combine_sections(expanded_sections, document_title, max_retries=5, initial_delay=1, initial_chunk_size=10):
+    def chunk_sections(sections, size):
+        for i in range(0, len(sections), size):
+            yield sections[i:i + size]
+
+    final_document = ""
+    chunk_size = initial_chunk_size
     
-    prompt = f"""
-    Kombinera följande expanderade sektioner till ett sammanhängande dokument. Gör minimala ändringar för att få texten att flyta naturligt, men behåll så mycket detaljerad information som möjligt. Undvik att komprimera eller sammanfatta för mycket.
+    print(f"\nCombining {len(expanded_sections)} expanded sections into final document")
 
-    Dokumenttitel: {document_title}
+    total_tokens_used = 0
+    requests_made = 0
+    start_time = time.time()
+    last_request_time = start_time
 
-    {sections_text}
+    while expanded_sections:
+        section_chunks = list(chunk_sections(expanded_sections, chunk_size))
+        print(f"Sections will be processed in {len(section_chunks)} chunks")
 
-    Formatera ditt svar enligt följande:
-    FINAL_DOCUMENT:
-    Det kombinerade, sammanhängande dokumentet här...
-    """
+        for i, chunk in enumerate(section_chunks):
+            print(f"\nProcessing chunk {i+1} of {len(section_chunks)}...")
+            
+            sections_text = "\n\n".join([f"Sektion {j+1}: {section['title']}\n\n{section['expanded_content']}" 
+                                         for j, section in enumerate(chunk)])
+            
+            prompt = f"""
+            Kombinera följande expanderade sektioner till en sammanhängande del av dokumentet. 
+            Gör minimala ändringar för att få texten att flyta naturligt, men behåll så mycket detaljerad information som möjligt. 
+            Undvik att komprimera eller sammanfatta för mycket.
 
-    for attempt in range(max_retries):
-        try:
-            print(f"  Attempt {attempt + 1} of {max_retries}")
-            response = client.messages.create(
-                model="claude-3-5-sonnet-20240620",
-                max_tokens=8192,
-                messages=[
-                    {"role": "user", "content": prompt}
-                ]
-            )
+            Detta är del {i+1} av {len(section_chunks)} av hela dokumentet.
 
-            response_text = response.content[0].text if response.content else ""
-            if response_text.startswith("FINAL_DOCUMENT:"):
-                print(f"Sections combined successfully")
-                return response_text[16:].strip()
-            else:
-                raise ValueError("Unexpected response format")
-        
-        except RateLimitError:
-            print(f"Rate limit exceeded on attempt {attempt + 1}")
-            if attempt < max_retries - 1:
-                delay = initial_delay * (2 ** attempt)
-                print(f"Rate limit exceeded. Retrying in {delay} seconds...")
-                time.sleep(delay)
-            else:
-                print("Max retries reached. Unable to process request.")
-                raise
-        except Exception as e:
-            print(f"An error occurred: {str(e)}")
-            raise
+            Dokumenttitel: {document_title}
 
-    print(f"Failed to combine sections after {max_retries} attempts")
-    raise Exception(f"Failed to combine sections after {max_retries} attempts")
+            {sections_text}
+
+            Formatera ditt svar enligt följande:
+            PARTIAL_DOCUMENT:
+            Den kombinerade, sammanhängande texten för denna del...
+            """
+
+            prompt_tokens = count_tokens(prompt)
+            max_tokens = 8192 - prompt_tokens
+
+            if max_tokens < 1:
+                print(f"Prompt too long. Reducing chunk size from {chunk_size} to {chunk_size // 2}")
+                chunk_size = max(1, chunk_size // 2)
+                break
+
+            for attempt in range(max_retries):
+                try:
+                    print(f"  Attempt {attempt + 1} of {max_retries}")
+
+                    # Check if we need to wait before making the next request
+                    current_time = time.time()
+                    time_since_last_request = current_time - last_request_time
+                    if time_since_last_request < 1.2:  # Ensure at least 1.2 seconds between requests
+                        time.sleep(1.2 - time_since_last_request)
+
+                    response = client.messages.create(
+                        model="claude-3-5-sonnet-20240620",
+                        max_tokens=max_tokens,
+                        messages=[
+                            {"role": "user", "content": prompt}
+                        ]
+                    )
+
+                    last_request_time = time.time()  # Update the last request time
+                    requests_made += 1
+
+                    response_text = response.content[0].text if response.content else ""
+                    response_tokens = count_tokens(response_text)
+                    total_tokens_used += prompt_tokens + response_tokens
+
+                    print(f"Tokens used in this request: {prompt_tokens + response_tokens}")
+                    print(f"Total tokens used so far: {total_tokens_used}")
+                    print(f"Total requests made: {requests_made}")
+
+                    if response_text.startswith("PARTIAL_DOCUMENT:"):
+                        partial_document = response_text[18:].strip()
+                        final_document += partial_document + "\n\n"
+                        print(f"  Chunk {i+1} successfully combined")
+                        expanded_sections = expanded_sections[len(chunk):]  # Remove processed sections
+                        break
+                    else:
+                        raise ValueError("Unexpected response format")
+                
+                except Exception as e:
+                    print(f"  An error occurred: {str(e)}")
+                    if attempt == max_retries - 1:
+                        raise
+
+            # Respect rate limits
+            if requests_made >= 50:
+                wait_time = 60 - (time.time() - start_time)
+                if wait_time > 0:
+                    print(f"Rate limit approached. Waiting {wait_time:.2f} seconds...")
+                    time.sleep(wait_time)
+                start_time = time.time()
+                requests_made = 0
+                total_tokens_used = 0
+
+    print("\nAll chunks processed and combined into final document")
+    return final_document.strip()
 
 def process_document(file_path):
     try:
@@ -250,10 +325,23 @@ def process_document(file_path):
 
         print("\nStep 2: Expanding each section...")
         expanded_sections = []
+        requests_made = 0
+        start_time = time.time()
+        last_request_time = start_time
+
         for i, section in enumerate(document_structure['sections'], 1):
             print(f"  Processing section {i} of {len(document_structure['sections'])}: {section['title']}")
             try:
+                # Check if we need to wait before making the next request
+                current_time = time.time()
+                time_since_last_request = current_time - last_request_time
+                if time_since_last_request < 1.2:  # Ensure at least 1.2 seconds between requests
+                    time.sleep(1.2 - time_since_last_request)
+
                 expanded_content = expand_section(section, document_structure.get('document_title', 'Unknown Title'))
+                last_request_time = time.time()  # Update the last request time
+                requests_made += 1
+
                 if expanded_content:
                     expanded_sections.append({
                         'title': section['title'],
@@ -262,18 +350,25 @@ def process_document(file_path):
                     print(f"  Section {i} expanded successfully")
                 else:
                     print(f"  Failed to expand section {i}: Empty content returned")
+
+                # Respect rate limits
+                if requests_made >= 50:
+                    wait_time = 60 - (time.time() - start_time)
+                    if wait_time > 0:
+                        print(f"Rate limit approached. Waiting {wait_time:.2f} seconds...")
+                        time.sleep(wait_time)
+                    start_time = time.time()
+                    requests_made = 0
+
             except Exception as e:
                 print(f"  Error expanding section {i}: {str(e)}")
-            
-            if i < len(document_structure['sections']):
-                print("  Waiting 12 seconds before processing next section...")
-                time.sleep(12)  # Pause between sections to respect rate limits
 
         if not expanded_sections:
             print("Failed to expand any sections")
             return None
 
         print(f"\nStep 3: Combining {len(expanded_sections)} sections into final document...")
+        
         try:
             final_document = combine_sections(expanded_sections, document_structure.get('document_title', 'Unknown Title'))
             if not final_document:
