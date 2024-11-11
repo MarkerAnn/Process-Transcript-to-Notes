@@ -1,2 +1,26 @@
-.env
+# Byte-compiled files
+__pycache__/
+*.py[cod]
+
+# Virtual environments
 venv/
+env/
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints
+
+# VSCode and Cursor files
+.vscode/
+*.code-workspace
+*.cursor/
+
+# Logg files and temporary files
+*.log
+*.tmp
+repomix-output.txt
+
+# Cache and system files
+*.DS_Store
+*.egg-info/
+.eggs/
+.cache/
